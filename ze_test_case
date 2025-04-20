@@ -1,1 +1,326 @@
 
+from logging import exception
+import re
+
+import requests
+import argparse
+import time
+import os
+import pandas as pd
+import numpy as np
+import time
+import json
+from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
+from pathlib import Path
+import boto3
+
+ZEPHYR_BASE_URL = 'https://api.zephyrscale.smartbear.com/v2/'
+ZEPHYR_REQUEST_HEADERS = {
+    'Authorization': 'Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjb250ZXh0Ijp7ImJhc2VVcmwiOiJodHRwczovL2ludmVzY28uYXRsYXNzaWFuLm5ldCIsInVzZXIiOnsiYWNjb3VudElkIjoiNjM2MzljZGZmZTVmZjM3NTIzNWMxMGZhIiwidG9rZW5JZCI6ImQyMzdlM2Y1LTc0ZGUtNGFkYS1iMDI3LWJiOGViMTA0YmY1YiJ9fSwiaXNzIjoiY29tLmthbm9haC50ZXN0LW1hbmFnZXIiLCJzdWIiOiJhYjhlZmNhZi0xYmM4LTNjZGMtYjNkNy05YTk0YmUyZWYzYjUiLCJleHAiOjE3NjM1OTc0OTQsImlhdCI6MTczMjA2MTQ5NH0.8cwY3tV9Bud8IZZWwwS46TTcXWbKlqbht97pxt7irhY',
+    'content-type': 'application/json'}
+JIRA_BASIC_AUTH = ('satish.duvvuri@invesco.com', 'fnH02vpg2vVcPuKruCS9B1E1')
+
+
+def api_post(endpoint, body):
+    error_msg = ""
+    try:
+        response = requests.post(ZEPHYR_BASE_URL + endpoint, headers=ZEPHYR_REQUEST_HEADERS,
+                                 data=json.dumps(body, indent=4))
+
+    except Exception as ex:
+        error_msg = str(ex)
+
+    return response.status_code, response, error_msg
+
+
+def api_put(endpoint, body):
+    error_msg = ""
+    response = requests.put(ZEPHYR_BASE_URL + endpoint, headers=ZEPHYR_REQUEST_HEADERS, data=json.dumps(body, indent=4))
+
+    return response.status_code, response, error_msg
+
+
+def api_get(url):
+    print("Executing call " + url)
+    response = requests.get(url, headers=ZEPHYR_REQUEST_HEADERS)
+
+    return response.status_code, response
+
+
+def jira_api_get(url):
+    print("Executing call " + url)
+    response = requests.get(url, auth=JIRA_BASIC_AUTH, verify=False)
+    return response.status_code, response
+
+
+def get_folder_name(url):
+    row = {'folder.self': url}
+    status_code, response = api_get(url)
+    if status_code != 200:
+        row['ZEPHYR FOLDER'] = pd.NA
+    else:
+        row['ZEPHYR FOLDER'] = response.json()['name']
+
+    index = [0]
+    return pd.DataFrame([row], index=index)
+
+
+def get_component_name(url):
+    row = {'component.self': url}
+    status_code, response = jira_api_get(url)
+    if status_code != 200:
+        row['VISION CAPABILITY'] = ""
+    else:
+        row['VISION CAPABILITY'] = response.json()['name']
+
+    index = [0]
+    return pd.DataFrame([row], index=index)
+
+
+def get_status_name(url):
+    row = {'status.self': url}
+    status_code, response = api_get(url)
+    if status_code != 200:
+        row['ZEPHYR APPROVAL STATUS'] = ""
+    else:
+        row['ZEPHYR APPROVAL STATUS'] = response.json()['name']
+
+    index = [0]
+    return pd.DataFrame([row], index=index)
+
+
+def get_owner_name(url):
+    row = {'owner.self': url}
+    status_code, response = jira_api_get(url)
+    if status_code != 200:
+        row['ZEPHYR TEST CASE OWNER'] = ""
+    else:
+        row['ZEPHYR TEST CASE OWNER'] = response.json()['displayName']
+
+    index = [0]
+    return pd.DataFrame([row], index=index)
+
+
+def get_priority_name(url):
+    row = {'priority.self': url}
+    status_code, response = api_get(url)
+    if status_code != 200:
+        row['ZEPHYR TEST CASE PRIORITY'] = ""
+    else:
+        row['ZEPHYR TEST CASE PRIORITY'] = response.json()['name']
+
+    index = [0]
+    return pd.DataFrame([row], index=index)
+
+
+def download_gherkin_script(row):
+    print("Downloading Gherkin Script for " + row['key'])
+    status_code, response = api_get(row['testScript.self'])
+    if status_code != 200:
+        print("Failed downloading Gherkin Script for " + row['key'])
+        gherkin_scripts = []
+    else:
+        responseJSON = response.json()
+        gherkin_script_raw = responseJSON.get('text', '')
+
+        if gherkin_script_raw.find('Examples:') > 0:
+            try:
+                parameters = gherkin_script_raw[gherkin_script_raw.find('Examples:') + 10:len(gherkin_script_raw)]
+                test_steps = gherkin_script_raw[0: gherkin_script_raw.find('Examples:')]
+
+                #Replace any escaped pipe character in gherkin script with a ?, so that pd.read_csv does not assume it to be a column seperator
+                str(parameters).replace("\|", "\?")
+                df = pd.read_csv(StringIO(parameters), sep="|")
+                df.columns = [s.strip() for s in df.columns]
+
+                #Restore \? with the pipe character in each of the columns
+                df.replace("\?", "|", inplace=True)
+
+                #Cast each column value as a string and strip all leading and trailing spaces
+                #Drop the unnamed columns
+                columns = df.columns.values
+                for column in columns:
+                    df[column] = df[column].astype(str)
+                    df[column] = df[column].str.strip()
+                    if "Unnamed" in column:
+                        df.drop(columns=[column], inplace=True)
+            except Exception as ex:
+                print("Failed parsing parameters for " + row['key'])
+                df = pd.DataFrame()
+
+            columns = df.columns.values
+            gherkin_scripts = []
+            for i, irow in df.iterrows():
+                script = test_steps
+                for column in columns:
+                    script = script.replace("<" + column + ">", irow[column])
+                gherkin_scripts.append(script)
+        else:
+            gherkin_scripts = [gherkin_script_raw]
+
+        # The Test Key is also added as a tag to the Feature
+        tags = "@test_case_id:" + row['key'] + ' '
+        tags += "@" + row['ZEPHYR EXECUTION TYPE'] + ' '
+
+        comments = "#Zephyr Status: " + row['ZEPHYR APPROVAL STATUS'] + '\n'
+        comments += "#Vision Capability: " + row['VISION CAPABILITY'] + '\n'
+        comments += "#Zephyr Folder: " + row['ZEPHYR FOLDER']
+        scenario = "Scenario: " + row['name']
+
+        gherkin_scripts = [
+            tags + " @parameter_id:" + str(i + 1) + "\r\n" + comments + "\r\n" + scenario + " [Parameter " + str(
+                i + 1) + "] \n" + gherkin_script for i, gherkin_script in enumerate(gherkin_scripts)]
+
+    return gherkin_scripts
+
+
+def get_test_cases_from_zephyr():
+    endpoint = 'testcases' + '?projectKey=IVIS' + '&startAt=0' + '&maxResults=100'
+    status_code, response = api_get(ZEPHYR_BASE_URL + endpoint)
+
+    if status_code != 200:
+        print("API Call failed :" + str(response))
+        responseJSON = {'isLast': True}
+        exit(1)
+    else:
+        responseJSON = response.json()
+        valuesDF = pd.json_normalize(responseJSON['values'])
+
+    while not responseJSON["isLast"]:
+        status_code, response = api_get(responseJSON['next'])
+        responseJSON = response.json()
+        valuesDF = pd.concat([valuesDF, pd.json_normalize(responseJSON['values'])])
+
+    valuesDF = valuesDF[['key', 'name', 'component.self', 'folder.self', 'status.self', 'testScript.self', 'owner.self',
+                         'priority.self', 'customFields.Script Reference']]
+
+    valuesDF['status.self'] = valuesDF['status.self'].astype(str)
+    status = valuesDF[valuesDF['status.self'] != 'nan']['status.self'].unique()
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        statusNamesDF = pd.concat(executor.map(get_status_name, status)).copy()
+    valuesDF = pd.merge(valuesDF, statusNamesDF, on=['status.self'], how='left')
+    valuesDF['ZEPHYR APPROVAL STATUS'].fillna("Unknown", inplace=True)
+
+    valuesDF['owner.self'] = valuesDF['owner.self'].astype(str)
+    owners = valuesDF[valuesDF['owner.self'] != 'nan']['owner.self'].unique()
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        ownerNamesDF = pd.concat(executor.map(get_owner_name, owners)).copy()
+    valuesDF = pd.merge(valuesDF, ownerNamesDF, on=['owner.self'], how='left')
+    valuesDF['ZEPHYR TEST CASE OWNER'].fillna("Unknown", inplace=True)
+
+    valuesDF['priority.self'] = valuesDF['priority.self'].astype(str)
+    priorities = valuesDF[valuesDF['priority.self'] != 'nan']['priority.self'].unique()
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        priorityNamesDF = pd.concat(executor.map(get_priority_name, priorities)).copy()
+    valuesDF = pd.merge(valuesDF, priorityNamesDF, on=['priority.self'], how='left')
+    valuesDF['ZEPHYR TEST CASE PRIORITY'].fillna("Unknown", inplace=True)
+
+    valuesDF['folder.self'] = valuesDF['folder.self'].astype(str)
+    folders = valuesDF[valuesDF['folder.self'] != 'nan']['folder.self'].unique()
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        folderNamesDF = pd.concat(executor.map(get_folder_name, folders)).copy()
+    valuesDF = pd.merge(valuesDF, folderNamesDF, on=['folder.self'], how='left')
+    valuesDF['ZEPHYR FOLDER'].fillna("Unknown", inplace=True)
+
+    valuesDF['component.self'] = valuesDF['component.self'].astype(str)
+    components = valuesDF[valuesDF['component.self'] != 'nan']['component.self'].unique()
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        componentNamesDF = pd.concat(executor.map(get_component_name, components)).copy()
+    valuesDF = pd.merge(valuesDF, componentNamesDF, on=['component.self'], how='left')
+    valuesDF['VISION CAPABILITY'].fillna("Unknown", inplace=True)
+    valuesDF['VISION CAPABILITY'] = valuesDF['VISION CAPABILITY'].astype(str).apply(
+        lambda x: "Unknown" if len(x) == 0 else x)
+
+    valuesDF['ZEPHYR EXECUTION TYPE'] = valuesDF['ZEPHYR APPROVAL STATUS'].apply(
+        lambda x: "Automated" if "Automation" in x else "Manual")
+
+    with ThreadPoolExecutor(max_workers=80) as executor:
+        valuesDF['BDD GHERKIN SCRIPT'] = list(executor.map(download_gherkin_script, valuesDF.to_dict('records')))
+
+    # Blow up Parametrized Gherkin Scripts into multiple rows
+    #valuesDF['BDD GHERKIN SCRIPT'] = valuesDF['BDD GHERKIN SCRIPT'].astype(str).apply(lambda x: x.split(','))
+    valuesDF = valuesDF.explode('BDD GHERKIN SCRIPT')
+    valuesDF['BDD GHERKIN SCRIPT'] = valuesDF['BDD GHERKIN SCRIPT'].astype(str)
+    # For each row generated for a specific test case, assign a unique id
+    valuesDF['PARAMETER ID'] = valuesDF.groupby(by=["key"]).cumcount() + 1
+
+    #For each Parameter Id, assign the script reference
+    valuesDF['customFields.Script Reference'] = valuesDF['customFields.Script Reference'].astype(str).apply(
+        lambda x: x.split(','))
+    valuesDF['Script Reference'] = valuesDF.apply(
+        lambda row: list(row['customFields.Script Reference'])[row['PARAMETER ID'] - 1] if len(
+            row['customFields.Script Reference']) >= row['PARAMETER ID'] else "", axis=1)
+    valuesDF['Script Reference'] = valuesDF['Script Reference'].apply(lambda x: str(x).lower())
+
+    valuesDF = valuesDF[
+        ['key', 'name', 'VISION CAPABILITY', 'ZEPHYR FOLDER', 'ZEPHYR APPROVAL STATUS', 'ZEPHYR TEST CASE OWNER',
+         'ZEPHYR TEST CASE PRIORITY', 'ZEPHYR EXECUTION TYPE',
+         'BDD GHERKIN SCRIPT', 'PARAMETER ID', 'Script Reference']]
+
+    valuesDF.rename(columns={'key': 'ZEPHYR TEST CASE ID', 'name': 'ZEPHYR TEST NAME'}, inplace=True)
+
+    return valuesDF
+
+
+def concatenate_gherkin_script(script_series):
+    separator_string = "\r\n################################################################\r\n"
+    filtered_list = [s for s in script_series if s != "nan"]
+    return separator_string.join(filtered_list)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Pass any one environment against which automated test needs to be run <dev/uat/prd/>')
+    required = parser.add_argument_group('required arguments')
+    required.add_argument('--report_dir', help='Pass a home location where reports exist', type=str, default="")
+    parser.add_argument("--S3_BUCKET", help="Optional S3 Bucket name", type=str, default=None)
+    parser.add_argument("--S3_FOLDER", help="Optional S3 Bucket Folder", type=str, default=None)
+    parser.add_argument("--execution_env", help="Optional S3 Bucket Folder", type=str, default="local")
+    parser.add_argument('--test_dir', help='comma separated list of values', type=str, default="vision_re_write")
+
+    args = parser.parse_args()
+    reportDirPath = args.report_dir
+    S3_FOLDER = args.S3_FOLDER
+    S3_BUCKET = args.S3_BUCKET
+    EXECUTION_ENV = args.execution_env
+    TEST_DIR = args.test_dir
+
+    os.makedirs(reportDirPath, exist_ok=True)
+
+    session = boto3.Session()
+    s3 = session.resource('s3')
+    featureDir = (Path(__file__).parent).joinpath(TEST_DIR, "features")
+    os.makedirs(featureDir, exist_ok=True)
+
+    resultDF = get_test_cases_from_zephyr()
+
+    # Generate Gherkin only for Approved Test Cases
+    gherkinDF = resultDF[resultDF['ZEPHYR APPROVAL STATUS'] == '7 - Automation - Approved'].groupby("VISION CAPABILITY",
+                                                                                                    as_index=False).agg(
+        {"BDD GHERKIN SCRIPT": concatenate_gherkin_script}).reset_index()
+    for i, row in gherkinDF.iterrows():
+        fileName = str(row["VISION CAPABILITY"]).replace(" - ", "_").replace(" ", "_").replace("&", "and").replace(".",
+                                                                                                                   "").lower() + ".feature"
+        if "aws_batch" == EXECUTION_ENV:
+            object = s3.Object(S3_BUCKET, S3_FOLDER + '/features/' + fileName)
+            result = object.put(Body=str(row['BDD GHERKIN SCRIPT']))
+            #If the tests are being executed on EC2, then save the file locally as well as upload them to S3
+        if "aws_ec2" == EXECUTION_ENV:
+            object = s3.Object(S3_BUCKET, S3_FOLDER + '/features/' + fileName)
+            result = object.put(Body=str(row['BDD GHERKIN SCRIPT']))
+            with open(featureDir.joinpath(fileName), 'w+', encoding="utf-8") as fp:
+                fp.write(str(row['BDD GHERKIN SCRIPT']))
+        else:
+            with open(featureDir.joinpath(fileName), 'w+', encoding="utf-8") as fp:
+                fp.write(str(row['BDD GHERKIN SCRIPT']))
+
+    resultDF = resultDF[
+        ['ZEPHYR TEST CASE ID', 'ZEPHYR TEST NAME', 'VISION CAPABILITY', 'ZEPHYR FOLDER', 'ZEPHYR APPROVAL STATUS',
+         'ZEPHYR TEST CASE OWNER', 'ZEPHYR TEST CASE PRIORITY', 'ZEPHYR EXECUTION TYPE', 'PARAMETER ID',
+         'Script Reference']]
+    print("Writing Test Case Meta Data to CSV file")
+    resultDF.to_csv(reportDirPath + os.sep + "zephyr_test_cases.csv", sep="|", index=False)
+    if "aws" in EXECUTION_ENV:
+        print("Uploading Test Case Meta Data to S3")
+        resultDF.to_csv("s3://" + S3_BUCKET + "/" + S3_FOLDER + "/" + "zephyr_test_cases.csv", sep="|", index=False)
