@@ -1,1 +1,149 @@
 
+import requests
+import argparse
+import os
+import pandas as pd
+import time
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+from urllib3 import disable_warnings
+disable_warnings()
+
+ZEPHYR_BASE_URL =  'https://api.zephyrscale.smartbear.com/v2/'
+ZEPHYR_REQUEST_HEADERS = {'Authorization': 'Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjb250ZXh0Ijp7ImJhc2VVcmwiOiJodHRwczovL2ludmVzY28uYXRsYXNzaWFuLm5ldCIsInVzZXIiOnsiYWNjb3VudElkIjoiNjM2MzljZGZmZTVmZjM3NTIzNWMxMGZhIiwidG9rZW5JZCI6ImQyMzdlM2Y1LTc0ZGUtNGFkYS1iMDI3LWJiOGViMTA0YmY1YiJ9fSwiaXNzIjoiY29tLmthbm9haC50ZXN0LW1hbmFnZXIiLCJzdWIiOiJhYjhlZmNhZi0xYmM4LTNjZGMtYjNkNy05YTk0YmUyZWYzYjUiLCJleHAiOjE3NjM1OTc0OTQsImlhdCI6MTczMjA2MTQ5NH0.8cwY3tV9Bud8IZZWwwS46TTcXWbKlqbht97pxt7irhY','content-type': 'application/json'}
+def api_post(endpoint,body):    
+    error_msg=""
+    try:
+        response = requests.post(ZEPHYR_BASE_URL+endpoint, headers=ZEPHYR_REQUEST_HEADERS, data=json.dumps(body, indent = 4) )
+        
+    except Exception as ex:
+        error_msg = str(ex)
+
+    return response.status_code, response, error_msg
+
+def call_test_executions_api(result):
+    print("Uploading Execution Results for " + str(result['ZEPHYR TEST CASE ID']))
+    global test_execution_json
+    test_execution_json['testCaseKey'] = str(result['ZEPHYR TEST CASE ID'])
+    test_execution_json['executionTime'] = result['TEST OVERALL EXECUTION TIME']
+    test_execution_json['statusName'] = result['TEST OVERALL STATUS']
+    test_execution_json['testScriptResults'] = result['TEST SCRIPT RESULTS']
+    
+    if result['ZEPHYR EXECUTION TYPE']=="Automated" and result['TEST OVERALL STATUS'] in ["Pass","Fail"]:
+        test_execution_json["executedById"] = "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077" # JIRA Automation User
+        test_execution_json["assignedToId"] = "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077"  # JIRA Automation User     
+    else:
+        test_execution_json["executedById"] = ""
+        test_execution_json["assignedToId"] = ""  
+
+    status_code, test_cycle_response, error = api_post('testexecutions/',test_execution_json)
+    if status_code!=201:
+        print("Upload of Test Execution results for " + str(result['ZEPHYR TEST CASE ID']) + " failed")
+    return str(status_code) + ":" + test_cycle_response.text
+
+def set_overall_status(status_series):
+    if 'failed' in status_series.tolist():
+        return 'Fail'
+    elif 'error' in status_series.tolist():
+        return 'Fail'
+    elif 'skipped' in status_series.tolist():
+        return 'Blocked'
+    elif 'passed' in status_series.tolist():
+        return 'Pass'
+    else:
+        return 'Not Executed'
+    
+def create_test_cycle_on_zephyr(iteration, env, datetimestamp):
+    cycle_name = iteration + "-" + env.upper() + "-" + datetimestamp
+        
+    print(f"Creating Test Cycle {cycle_name} on Zephyr for {env.upper()}")
+
+    test_cycle_json = {
+            "projectKey": "IVIS",
+            "name": cycle_name,
+            "description": "Vision UX Regression Test Cycle",
+            "plannedStartDate": time.strftime("%Y-%m-%dT00:00:00.000Z", time.localtime()),
+            "plannedEndDate": time.strftime("%Y-%m-%dT00:00:00.000Z", time.localtime()),
+            "statusName": "Not Executed"
+            }
+    
+    status_code,test_cycle_response, error = api_post('testcycles/',test_cycle_json)
+    if len(error)>0:
+        print("Error while creating Test cycle on Zephyr : " + error)
+        exit(1)
+    if status_code>399:
+        print("Error while creating Test cycle on Zephyr : " + test_cycle_response.text)
+        exit(1)
+
+    test_cycle_key = test_cycle_response.json()['key']
+    print(f"Test Cycle with key {test_cycle_key} created on Zephyr")
+    return test_cycle_key
+
+def prepare_script_results(status_series):
+    script_results = []
+    for status in status_series:
+        if status == 'failed' or status == 'error':
+            zephyr_execution_status="Fail"
+        elif status == 'passed':
+            zephyr_execution_status="Pass"
+        else:
+            zephyr_execution_status="Not Executed"
+
+        script_result = {"statusName":zephyr_execution_status,"actualEndDate":time.strftime("%Y-%m-%dT00:00:00.000Z", time.localtime()),"actualResult":""}
+        script_results.append(script_result)
+    
+    return script_results
+
+def calc_overall_duration(dur_series):
+    return round(sum(dur_series.tolist()), 2)
+
+if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(description='Pass any one environment against which automated test needs to be run <dev/uat/prd/>')
+    required = parser.add_argument_group('required arguments')
+    required.add_argument('--env', help='Pass any one environment against which automated test needs to be run <dev/uat/prd/>', type=str, required=True)
+    required.add_argument('--report_dir', help='Pass a home location where reports exist', type=str, required=True)
+    parser.add_argument('--iteration', help='A number to identify the iteration of test execution', type=str, default="0")
+    parser.add_argument('--datetimestamp', help='A datetime string in the format yyyy-mm-dd_HH-MM-SS', type=str, required=True)
+
+    args = parser.parse_args()
+    env = args.env
+    reportDirPath = args.report_dir
+    iteration = args.iteration
+    datetimestamp = args.datetimestamp
+    
+    
+    test_cycle_key = create_test_cycle_on_zephyr(iteration, env, datetimestamp)
+    #test_cycle_key = 'IVIS-R322'
+    print("Uploading Test Execution Results to Zephyr Test cycle" + test_cycle_key)
+
+    global test_execution_json
+    test_execution_json = {
+    "projectKey": "IVIS",
+    "testCycleKey": test_cycle_key,
+    "environmentName": env.upper()     
+    }
+    result_df = pd.read_csv(reportDirPath + os.sep + "execution_results.csv", sep="|")
+    result_df['TEST EXECUTION TIME'].fillna(0, inplace=True)
+    result_df['TEST EXECUTION STATUS'].fillna("", inplace=True)
+    #Upload Execution results of only the Automated Tests
+    result_df = result_df[result_df['ZEPHYR EXECUTION TYPE']=='Automated']
+
+    grouped_result = result_df.groupby(["ZEPHYR TEST CASE ID","ZEPHYR EXECUTION TYPE"], as_index=False).agg(**{
+                                                                                        "TEST SCRIPT RESULTS": pd.NamedAgg(column='TEST EXECUTION STATUS', aggfunc=prepare_script_results),
+                                                                                        "TEST OVERALL STATUS": pd.NamedAgg(column='TEST EXECUTION STATUS', aggfunc=set_overall_status),
+                                                                                        "TEST OVERALL EXECUTION TIME": pd.NamedAgg(column='TEST EXECUTION TIME', aggfunc=calc_overall_duration)
+                                                                                    })
+    grouped_result.reset_index(drop=False,inplace=True)
+
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        grouped_result['zephyr_upload_http_status'] = list(executor.map(call_test_executions_api, grouped_result.to_dict('records')))
+    
+    grouped_result = grouped_result[["ZEPHYR TEST CASE ID",'zephyr_upload_http_status']]
+    result_df = pd.merge(result_df, grouped_result, how="left", on ="ZEPHYR TEST CASE ID")
+        
+    result_df['ZEPHYR TEST CYCLE'] = test_cycle_key
+    result_df['TEST EXECUTION ENVIRONMENT'] = env.upper()
+    result_df['TEST EXECUTION DATE'] = time.strftime("%Y-%m-%d", time.localtime())
+    result_df.to_csv(reportDirPath + os.sep +"execution_results.csv", sep="|", index=False)
